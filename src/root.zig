@@ -1,26 +1,50 @@
 const std = @import("std");
 
+// TODO: clean whole maybeDeinit subsystem up; all of these functions and the Arc.deinit fn. there's a bit of
+//  copy-n-paste and passing between of variables/types.
+
+// i can has methods?
+/// returns `true` if `T` is a type which can have methods
+fn canHasMethods(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => true,
+        else => false,
+    };
+}
+
 /// check if `T` has method `name` with either signature in `sigs`
 fn hasAnyMethod(comptime T: type, comptime name: []const u8, comptime sigs: [2]type) bool {
-    switch (@typeInfo(T)) {
-        .@"struct", .@"enum", .@"union", .@"opaque" => {},
-        else => {
-            return false;
-        },
-    }
-    if (!@hasDecl(T, name)) return false;
+    if (comptime !canHasMethods(T) or !@hasDecl(T, name)) return false;
+
     inline for (sigs) |Sig| {
         if (@TypeOf(@field(T, name)) == Sig) return true;
     }
     return false;
 }
 
-/// attempts to deconstruct `val` of type `T` there is a `deinit` method, fails otherwise.
+fn tDeinitRet(comptime T: type) type {
+    if (comptime !canHasMethods(T) or !@hasDecl(T, "deinit")) return void;
+
+    if (comptime @typeInfo(@TypeOf(T.deinit)).@"fn".return_type) |r| {
+        // `r` return type
+        return r;
+    } else {
+        // `void` return type
+        // man this weird type = val system is kinda hard to wrap my head around but i love it
+        return void;
+    }
+}
+
+/// attempts to deconstruct `val` of type `T` there is a `deinit` method, nop otherwise.
 ///
 /// takes a pointer to avoid bringing very large `T` onto the stack.
-fn maybeDeinit(comptime T: type, val: *T) void {
-    if (comptime hasAnyMethod(T, "deinit", .{ fn (*T) void, fn (T) void })) {
-        val.deinit();
+fn maybeDeinit(comptime T: type, comptime TDeinit: type, val: *T) TDeinit {
+    // we allow both deinits which take *T and T
+    if (comptime hasAnyMethod(T, "deinit", .{ fn (*T) TDeinit, fn (T) TDeinit })) {
+        return val.deinit();
+    } else {
+        // implicit void return works here but i think this is cleaner
+        return;
     }
 }
 
@@ -31,6 +55,8 @@ fn InnerTy(comptime T: type) type {
 
 pub fn Arc(comptime T: type) type {
     return struct {
+        const TDeinit = tDeinitRet(T);
+
         pub const WeakRef = Weak(T);
         const Self = @This();
         const Inner = InnerTy(T);
@@ -50,19 +76,23 @@ pub fn Arc(comptime T: type) type {
             return Self{ .inner = inner };
         }
 
-        pub fn deinit(self: Self) void {
+        // TODO: this currently returns ?void if T.deinit doesn't exist or returns void. it should only be an optional
+        //  if TDeinit return type isn't void (?TDeinit or void, never ?void).
+        pub fn deinit(self: Self) ?TDeinit {
             // assuming fetchSub returns previous value, not new
             if (self.inner.strong.fetchSub(1, .release) != 1) {
-                return;
+                return null;
             }
             // assuming this works in theory for zig like it does rust rather than a full fence
             _ = self.inner.strong.load(.acquire);
 
             // deconstruct the data if it requires deconstruction
-            maybeDeinit(T, &self.inner.data);
+            const ret = maybeDeinit(T, TDeinit, &self.inner.data);
 
             // Weak deinit handles deallocation
             (Weak(T){ .inner = self.inner }).deinit();
+
+            return ret;
         }
 
         pub fn clone(self: Self) Self {
@@ -106,7 +136,6 @@ pub fn Arc(comptime T: type) type {
     };
 }
 
-// no comptime A for now, may be necessary later
 pub fn Weak(comptime T: type) type {
     return struct {
         pub const StrongRef = Arc(T);
