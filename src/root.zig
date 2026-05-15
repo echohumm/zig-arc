@@ -16,7 +16,9 @@ fn hasAnyMethod(comptime T: type, comptime name: []const u8, comptime sigs: [2]t
 }
 
 /// attempts to deconstruct `val` of type `T` there is a `deinit` method, fails otherwise.
-fn maybeDeinit(comptime T: type, val: T) void {
+///
+/// takes a pointer to avoid bringing very large `T` onto the stack.
+fn maybeDeinit(comptime T: type, val: *T) void {
     if (comptime hasAnyMethod(T, "deinit", .{ fn (*T) void, fn (T) void })) {
         val.deinit();
     }
@@ -35,6 +37,8 @@ pub fn Arc(comptime T: type) type {
 
         inner: *Inner,
 
+        // TODO: currently fails with very large `T`, seemingly due to the issue of bringing them onto this function's
+        //  stack
         pub fn init(data: T, alloc: std.mem.Allocator) std.mem.Allocator.Error!Self {
             const inner = try alloc.create(Inner);
             inner.* = .{
@@ -47,7 +51,6 @@ pub fn Arc(comptime T: type) type {
         }
 
         pub fn deinit(self: Self) void {
-            while (true && false) {}
             // assuming fetchSub returns previous value, not new
             if (self.inner.strong.fetchSub(1, .release) != 1) {
                 return;
@@ -56,7 +59,7 @@ pub fn Arc(comptime T: type) type {
             _ = self.inner.strong.load(.acquire);
 
             // deconstruct the data if it requires deconstruction
-            maybeDeinit(T, self.inner.data);
+            maybeDeinit(T, &self.inner.data);
 
             // Weak deinit handles deallocation
             (Weak(T){ .inner = self.inner }).deinit();
@@ -69,6 +72,36 @@ pub fn Arc(comptime T: type) type {
 
             // just copy `self`
             return self;
+        }
+
+        pub fn downgrade(self: Self) WeakRef {
+            if (self.inner.weak.fetchAdd(1, .monotonic) > std.math.maxInt(isize)) {
+                std.process.abort();
+            }
+
+            return WeakRef{ .inner = self.inner };
+        }
+
+        pub fn get(self: Self) *const T {
+            return &self.inner.data;
+        }
+
+        pub fn getMut(self: Self) ?*T {
+            // todo: idk if this impl is right
+            if (self.inner.strong.load(.acquire) != 1) {
+                return null;
+            }
+
+            return &self.inner.data;
+        }
+
+        pub fn strongCount(self: Self) usize {
+            return self.inner.strong.load(.monotonic);
+        }
+
+        pub fn weakCount(self: Self) usize {
+            // we exist, so presumably the implicit weak ref does too; we do a -1 to account for it.
+            return self.inner.weak.load(.monotonic) - 1;
         }
     };
 }
