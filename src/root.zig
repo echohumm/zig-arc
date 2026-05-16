@@ -12,35 +12,15 @@ fn canHasMethods(comptime T: type) bool {
     };
 }
 
-/// check if `T` has method `name` with either signature in `sigs`
-fn hasAnyMethod(comptime T: type, comptime name: []const u8, comptime sigs: [2]type) bool {
-    if (comptime !canHasMethods(T) or !@hasDecl(T, name)) return false;
-
-    inline for (sigs) |Sig| {
-        if (@TypeOf(@field(T, name)) == Sig) return true;
-    }
-    return false;
-}
-
-fn tDeinitRet(comptime T: type) type {
-    if (comptime !canHasMethods(T) or !@hasDecl(T, "deinit")) return void;
-
-    if (comptime @typeInfo(@TypeOf(T.deinit)).@"fn".return_type) |r| {
-        // `r` return type
-        return r;
-    } else {
-        // `void` return type
-        // man this weird type = val system is kinda hard to wrap my head around but i love it
-        return void;
-    }
-}
-
 /// attempts to deconstruct `val` of type `T` there is a `deinit` method, nop otherwise.
 ///
 /// takes a pointer to avoid bringing very large `T` onto the stack.
 fn maybeDeinit(comptime T: type, comptime TDeinit: type, val: *T) TDeinit {
+    if (comptime !canHasMethods(T) or !@hasDecl(T, "deinit")) return;
+
+    const sig = @TypeOf(@field(T, "deinit"));
     // we allow both deinits which take *T and T
-    if (comptime hasAnyMethod(T, "deinit", .{ fn (*T) TDeinit, fn (T) TDeinit })) {
+    if (comptime sig == fn(T) TDeinit or sig == fn(*T) TDeinit) {
         return val.deinit();
     } else {
         // implicit void return works here but i think this is cleaner
@@ -55,7 +35,16 @@ fn InnerTy(comptime T: type) type {
 
 pub fn Arc(comptime T: type) type {
     return struct {
-        const TDeinit = tDeinitRet(T);
+        const TDeinit = blk: {
+            // if `T` can't have methods or doesn't have a `deinit` member, default to void.
+            if (!canHasMethods(T) or !@hasDecl(T, "deinit")) break :blk void;
+
+            const info = @typeInfo(@TypeOf(T.deinit));
+            // if `deinit` isn't a function, default
+            if (info != .@"fn") break :blk void;
+
+            if (@typeInfo(@TypeOf(T.deinit)).@"fn".return_type) |r| break :blk r else break :blk void;
+        };
 
         pub const WeakRef = Weak(T);
         const Self = @This();
@@ -63,8 +52,8 @@ pub fn Arc(comptime T: type) type {
 
         inner: *Inner,
 
-        // TODO: currently fails with very large `T`, seemingly due to the issue of bringing them onto this function's
-        //  stack
+        // TODO: currently fails with very large `T` (somewhere between 838608 and 16777216),
+        //  seemingly due to the issue of bringing them onto this function's stack?
         pub fn init(data: T, alloc: std.mem.Allocator) std.mem.Allocator.Error!Self {
             const inner = try alloc.create(Inner);
             inner.* = .{
